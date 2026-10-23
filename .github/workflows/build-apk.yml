@@ -1,10 +1,12 @@
 
-name: Build Standard 2800 APK
+name: Build Standard 2800 V5 Release APK
 
 on:
   workflow_dispatch:
   push:
-    branches: [main, master]
+    branches:
+      - main
+      - master
 
 permissions:
   contents: read
@@ -29,7 +31,7 @@ jobs:
           channel: stable
           cache: true
 
-      - name: Generate Android platform files if absent
+      - name: Generate Android platform
         run: |
           if [ ! -d android ]; then
             flutter create --platforms=android .
@@ -38,26 +40,123 @@ jobs:
       - name: Install dependencies
         run: flutter pub get
 
-      - name: Analyze source
+      - name: Configure release signing
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
-          set +e
-          flutter analyze --no-pub
-          ANALYZE_EXIT=$?
           set -e
 
-          if [ "$ANALYZE_EXIT" -ne 0 ]; then
-            echo "::warning::Flutter analyze reported issues. Tests and APK build will determine whether the project can proceed."
-          fi
+          test -n "$KEYSTORE_BASE64"
+          test -n "$KEYSTORE_PASSWORD"
+          test -n "$KEY_ALIAS"
+          test -n "$KEY_PASSWORD"
+
+          echo "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/release-keystore.jks"
+          test -s "$RUNNER_TEMP/release-keystore.jks"
+
+          cat > android/key.properties <<EOF
+          storePassword=$KEYSTORE_PASSWORD
+          keyPassword=$KEY_PASSWORD
+          keyAlias=$KEY_ALIAS
+          storeFile=$RUNNER_TEMP/release-keystore.jks
+          EOF
+
+      - name: Configure Android Gradle signing
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          candidates = [
+              Path("android/app/build.gradle"),
+              Path("android/app/build.gradle.kts"),
+          ]
+          gradle = next((p for p in candidates if p.exists()), None)
+
+          if gradle is None:
+              raise SystemExit("Android app Gradle file not found")
+
+          text = gradle.read_text()
+          if gradle.name == "build.gradle":
+              signing = '''
+          def keystoreProperties = new Properties()
+          def keystorePropertiesFile = rootProject.file("key.properties")
+          if (keystorePropertiesFile.exists()) {
+              keystoreProperties.load(new FileInputStream(keystorePropertiesFile))
+          }
+
+          '''
+              if "signingConfigs {" not in text:
+                  marker = "android {"
+                  if marker not in text:
+                      raise SystemExit("android block not found")
+                  text = text.replace(marker, marker + "\n" + signing, 1)
+
+              if "signingConfigs {" not in text:
+                  text = text.replace(
+                      "android {",
+                      '''android {
+              signingConfigs {
+                  release {
+                      keyAlias keystoreProperties["keyAlias"]
+                      keyPassword keystoreProperties["keyPassword"]
+                      storeFile file(keystoreProperties["storeFile"])
+                      storePassword keystoreProperties["storePassword"]
+                  }
+              }
+          ''',
+                      1,
+                  )
+
+              if "buildTypes {" in text and "signingConfig signingConfigs.release" not in text:
+                  text = text.replace(
+                      "buildTypes {",
+                      '''buildTypes {
+                  release {
+                      signingConfig signingConfigs.release
+                  }
+          ''',
+                      1,
+                  )
+              elif "buildTypes {" not in text:
+                  text = text.replace(
+                      "\n}",
+                      '''
+              buildTypes {
+                  release {
+                      signingConfig signingConfigs.release
+                  }
+              }
+          }
+          ''',
+                      1,
+                  )
+          else:
+              raise SystemExit(
+                  "Kotlin DSL build.gradle.kts detected. This workflow needs a Kotlin DSL signing configuration."
+              )
+
+          gradle.write_text(text)
+          print(f"Configured signing in {gradle}")
+          PY
 
       - name: Run tests
         run: flutter test
 
-      - name: Build release APK
+      - name: Build signed release APK
         run: flutter build apk --release
+
+      - name: Verify APK signature
+        run: |
+          APK="build/app/outputs/flutter-apk/app-release.apk"
+          test -s "$APK"
+          jarsigner -verify "$APK"
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
         with:
-          name: standard-2800-v5-apk
+          name: standard-2800-v5-release-apk
           path: build/app/outputs/flutter-apk/app-release.apk
           if-no-files-found: error
