@@ -1,4 +1,3 @@
-
 name: Build Standard 2800 V5 Release APK
 
 on:
@@ -46,15 +45,18 @@ jobs:
           KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        shell: bash
         run: |
-          set -e
+          set -euo pipefail
 
           test -n "$KEYSTORE_BASE64"
           test -n "$KEYSTORE_PASSWORD"
           test -n "$KEY_ALIAS"
           test -n "$KEY_PASSWORD"
 
-          echo "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/release-keystore.jks"
+          echo "$KEYSTORE_BASE64" | base64 --decode \
+            > "$RUNNER_TEMP/release-keystore.jks"
+
           test -s "$RUNNER_TEMP/release-keystore.jks"
 
           cat > android/key.properties <<EOF
@@ -65,22 +67,86 @@ jobs:
           EOF
 
       - name: Configure Android Gradle signing
+        shell: bash
         run: |
           python3 - <<'PY'
           from pathlib import Path
+          import re
 
-          candidates = [
-              Path("android/app/build.gradle"),
-              Path("android/app/build.gradle.kts"),
-          ]
-          gradle = next((p for p in candidates if p.exists()), None)
+          groovy = Path("android/app/build.gradle")
+          kotlin = Path("android/app/build.gradle.kts")
 
-          if gradle is None:
-              raise SystemExit("Android app Gradle file not found")
+          if groovy.exists():
+              p = groovy
+              is_kotlin = False
+          elif kotlin.exists():
+              p = kotlin
+              is_kotlin = True
+          else:
+              raise SystemExit("Android Gradle file not found")
 
-          text = gradle.read_text()
-          if gradle.name == "build.gradle":
+          s = p.read_text()
+
+          if is_kotlin:
+              imports = (
+                  "import java.util.Properties\n"
+                  "import java.io.FileInputStream\n\n"
+              )
+              if "import java.util.Properties" not in s:
+                  s = imports + s
+
+              properties = '''
+          val keystoreProperties = Properties()
+          val keystorePropertiesFile = rootProject.file("key.properties")
+          if (keystorePropertiesFile.exists()) {
+              keystoreProperties.load(FileInputStream(keystorePropertiesFile))
+          }
+
+          '''
+
+              if "val keystoreProperties = Properties()" not in s:
+                  s = s.replace("android {", properties + "android {", 1)
+
               signing = '''
+              signingConfigs {
+                  create("release") {
+                      keyAlias = keystoreProperties["keyAlias"] as String
+                      keyPassword = keystoreProperties["keyPassword"] as String
+                      storeFile = file(keystoreProperties["storeFile"] as String)
+                      storePassword = keystoreProperties["storePassword"] as String
+                  }
+              }
+
+          '''
+
+              if 'create("release")' not in s:
+                  s = s.replace("    buildTypes {", signing + "    buildTypes {", 1)
+
+              if 'signingConfig = signingConfigs.getByName("release")' not in s:
+                  pattern = r'(buildTypes\s*\{\s*release\s*\{)'
+                  s, count = re.subn(
+                      pattern,
+                      r'\1\n            signingConfig = signingConfigs.getByName("release")',
+                      s,
+                      count=1
+                  )
+                  if count == 0:
+                      raise SystemExit("Could not find release build type")
+
+              s = s.replace(
+                  'signingConfig = signingConfigs.getByName("debug")',
+                  'signingConfig = signingConfigs.getByName("release")'
+              )
+
+          else:
+              imports = (
+                  "import java.util.Properties\n"
+                  "import java.io.FileInputStream\n\n"
+              )
+              if "import java.util.Properties" not in s:
+                  s = imports + s
+
+              properties = '''
           def keystoreProperties = new Properties()
           def keystorePropertiesFile = rootProject.file("key.properties")
           if (keystorePropertiesFile.exists()) {
@@ -88,16 +154,11 @@ jobs:
           }
 
           '''
-              if "signingConfigs {" not in text:
-                  marker = "android {"
-                  if marker not in text:
-                      raise SystemExit("android block not found")
-                  text = text.replace(marker, marker + "\n" + signing, 1)
 
-              if "signingConfigs {" not in text:
-                  text = text.replace(
-                      "android {",
-                      '''android {
+              if "def keystoreProperties = new Properties()" not in s:
+                  s = s.replace("android {", properties + "android {", 1)
+
+              signing = '''
               signingConfigs {
                   release {
                       keyAlias keystoreProperties["keyAlias"]
@@ -106,40 +167,30 @@ jobs:
                       storePassword keystoreProperties["storePassword"]
                   }
               }
-          ''',
-                      1,
-                  )
 
-              if "buildTypes {" in text and "signingConfig signingConfigs.release" not in text:
-                  text = text.replace(
-                      "buildTypes {",
-                      '''buildTypes {
-                  release {
-                      signingConfig signingConfigs.release
-                  }
-          ''',
-                      1,
+          '''
+
+              if "signingConfigs {" not in s:
+                  s = s.replace("    buildTypes {", signing + "    buildTypes {", 1)
+
+              if "signingConfig signingConfigs.release" not in s:
+                  pattern = r'(buildTypes\s*\{\s*release\s*\{)'
+                  s, count = re.subn(
+                      pattern,
+                      r'\1\n            signingConfig signingConfigs.release',
+                      s,
+                      count=1
                   )
-              elif "buildTypes {" not in text:
-                  text = text.replace(
-                      "\n}",
-                      '''
-              buildTypes {
-                  release {
-                      signingConfig signingConfigs.release
-                  }
-              }
-          }
-          ''',
-                      1,
-                  )
-          else:
-              raise SystemExit(
-                  "Kotlin DSL build.gradle.kts detected. This workflow needs a Kotlin DSL signing configuration."
+                  if count == 0:
+                      raise SystemExit("Could not find release build type")
+
+              s = s.replace(
+                  "signingConfig signingConfigs.debug",
+                  "signingConfig signingConfigs.release"
               )
 
-          gradle.write_text(text)
-          print(f"Configured signing in {gradle}")
+          p.write_text(s)
+          print(f"Configured release signing in {p}")
           PY
 
       - name: Run tests
@@ -149,10 +200,18 @@ jobs:
         run: flutter build apk --release
 
       - name: Verify APK signature
+        shell: bash
         run: |
+          set -euo pipefail
+
           APK="build/app/outputs/flutter-apk/app-release.apk"
           test -s "$APK"
-          jarsigner -verify "$APK"
+
+          APKSIGNER="$(find "$ANDROID_HOME/build-tools" \
+            -name apksigner -type f | sort -V | tail -n 1)"
+
+          test -n "$APKSIGNER"
+          "$APKSIGNER" verify --verbose "$APK"
 
       - name: Upload APK artifact
         uses: actions/upload-artifact@v4
